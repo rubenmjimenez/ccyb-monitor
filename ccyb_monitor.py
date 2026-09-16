@@ -8,53 +8,47 @@ de capital anticíclico (CCyB) de cada país:
 
     https://www.esrb.europa.eu/national_policy/ccb/shared/data/esrb.ccybd_CCyB_data.xlsx
 
-Cada vez que se ejecuta:
+El archivo es una BASE DE DATOS HISTÓRICA: cada fila es una decisión de un
+país (columnas reales confirmadas: 'Country', 'Decision on',
+'Date of Announcement', 'CCyB rate', 'Type of setting', 'Application since',
+'Credit-to-GDP', 'Reference date', 'Credit Gap', 'Buffer Guide',
+'Additional Gap', 'Additional benchmark', 'Justification',
+'Justification exceptional circumstances', 'Period without decrease', 'Link').
+Un mismo país puede tener muchas filas: unas con fecha de aplicación ya
+pasada (vigentes) y otras con fecha futura (pendientes).
+
+Cada vez que se ejecuta este script:
   1. Descarga el Excel más reciente.
-  2. Compara los datos con la última "foto" guardada (data/last_snapshot.json)
-     para detectar si la ESRB ha publicado algo nuevo desde la última vez.
-  3. Busca, para cada país, si hay un cambio de colchón cuya fecha de
-     aplicación caiga dentro de la ventana "a un mes vista" (por defecto,
-     los próximos 35 días desde hoy).
+  2. Calcula un hash de toda la tabla y lo compara con el de la última vez
+     (data/last_snapshot.json) para saber si la ESRB ha publicado algo
+     nuevo desde el último chequeo.
+  3. Para cada país, calcula qué tasa está en vigor HOY (la decisión con
+     'Application since' más reciente que ya haya pasado) y busca si hay
+     alguna decisión pendiente cuya 'Application since' caiga dentro de la
+     ventana "a un mes vista" (por defecto, los próximos 35 días).
   4. Envía SIEMPRE un email mensual con el resultado:
-       - Si hay cambios a un mes vista: los detalla país por país.
+       - Si hay cambios a un mes vista: los detalla país por país,
+         ej. "Polonia subirá el CCyB del 1% al 2%, efectivo desde el 30
+         de septiembre de 2026."
        - Si no hay ninguno: "No se han detectado cambios de CCyB en
          ningún país a un mes vista."
-     Además añade, si procede, un aviso de que la ESRB ha actualizado la
-     tabla desde el último chequeo (aunque el cambio no caiga en la
-     ventana de un mes).
 
 -------------------------------------------------------------------------
-CALIBRACIÓN (IMPORTANTE, LEER ANTES DEL PRIMER USO)
+CALIBRACIÓN
 -------------------------------------------------------------------------
-No he podido descargar el Excel de la ESRB desde este entorno para
-verificar el nombre EXACTO de sus columnas (el dominio esrb.europa.eu no
-es accesible desde aquí). Por eso este script:
+Ejecuta en cualquier momento (localmente o vía GitHub Actions con
+mode=diagnose):
 
-  a) SIEMPRE es capaz de decirte si la ESRB ha tocado la tabla desde la
-     última vez (compara la fila completa de cada país, columna por
-     columna, así que funciona pase lo que pase con los nombres).
+    python ccyb_monitor.py --diagnose
 
-  b) Para el aviso "a un mes vista" necesita identificar qué columnas son
-     "país", "tasa actual", "fecha de aplicación actual", "tasa futura" y
-     "fecha de aplicación futura". Lo intenta de forma automática por
-     palabras clave (ver COLUMN_HINTS más abajo), pero como no he podido
-     ver el archivo real, TE RECOMIENDO hacer esto una sola vez:
-
-       1. Ejecuta:  python ccyb_monitor.py --diagnose
-          Esto descarga el Excel, imprime el nombre real de cada columna
-          y las primeras filas, y te dice qué columnas ha detectado para
-          cada categoría, SIN enviar ningún email.
-       2. Si el detector automático acierta (lo normal), no tienes que
-          tocar nada más.
-       3. Si NO acierta, añade la palabra exacta que veas en la columna
-          conflictiva a la lista correspondiente dentro de COLUMN_HINTS.
-
-Esto solo hay que hacerlo una vez; si la ESRB cambia el formato del
-archivo en el futuro, el modo --diagnose te lo dirá (te avisará si no
-logra encontrar alguna columna).
+para ver las columnas reales del Excel y confirmar que el script las ha
+identificado bien. Si la ESRB cambia el nombre de alguna columna en el
+futuro, este modo te lo dirá y solo tendrás que añadir la palabra nueva a
+COLUMN_HINTS, un poco más abajo.
 """
 
 import argparse
+import hashlib
 import io
 import json
 import os
@@ -81,18 +75,15 @@ SNAPSHOT_PATH = BASE_DIR / "data" / "last_snapshot.json"
 LOOKAHEAD_DAYS = 35
 
 # Palabras clave (en minúsculas y sin acentos) para reconocer cada columna
-# automáticamente. Si el modo --diagnose falla en detectar alguna, añade
-# aquí la palabra exacta que veas impresa por --diagnose.
+# automáticamente. Confirmadas contra el Excel real de la ESRB (sept. 2026):
+# 'Country', 'Decision on', 'Date of Announcement', 'CCyB rate',
+# 'Type of setting', 'Application since', ...
 COLUMN_HINTS = {
-    "country": ["country", "member state", "pais", "estado miembro"],
-    "current_rate": ["current ccyb", "current rate", "applicable rate",
-                      "rate in effect", "ccyb rate (current)"],
-    "current_date": ["date of application", "applicable as of",
-                      "effective date", "date of applicability"],
-    "future_rate": ["future ccyb", "future rate", "pending rate",
-                     "announced rate", "ccyb rate (future)"],
-    "future_date": ["future date", "pending date",
-                     "date of future application", "date of future"],
+    "country": ["country"],
+    "rate": ["ccyb rate", "rate"],
+    "application_date": ["application since", "applicable", "in effect since"],
+    "decision_date": ["decision on"],
+    "announcement_date": ["date of announcement"],
 }
 
 # Email
@@ -145,7 +136,6 @@ def load_table(xlsx_bytes: bytes) -> pd.DataFrame:
             break
 
     if header_row is None:
-        # Si no la detecta, asumimos que la primera fila es la cabecera.
         header_row = 0
 
     df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=0, header=header_row)
@@ -155,16 +145,26 @@ def load_table(xlsx_bytes: bytes) -> pd.DataFrame:
 
 
 def detect_columns(df: pd.DataFrame) -> dict:
-    """Empareja cada columna del Excel con una categoría de COLUMN_HINTS."""
+    """Empareja cada columna del Excel con una categoría de COLUMN_HINTS.
+    Usa coincidencia por palabra clave más larga primero, para evitar que
+    p.ej. 'rate' (hint genérico) se cuele antes que 'ccyb rate'."""
     detected = {}
     normalized_cols = {col: normalize(col) for col in df.columns}
+    used_cols = set()
 
     for category, hints in COLUMN_HINTS.items():
         match = None
-        for col, norm_col in normalized_cols.items():
-            if any(hint in norm_col for hint in hints):
-                match = col
+        for hint in sorted(hints, key=len, reverse=True):
+            for col, norm_col in normalized_cols.items():
+                if col in used_cols:
+                    continue
+                if hint in norm_col:
+                    match = col
+                    break
+            if match:
                 break
+        if match:
+            used_cols.add(match)
         detected[category] = match
 
     return detected
@@ -173,8 +173,10 @@ def detect_columns(df: pd.DataFrame) -> dict:
 def parse_date(value):
     if pd.isna(value):
         return None
-    if isinstance(value, (datetime, date)):
-        return value if isinstance(value, date) and not isinstance(value, datetime) else value.date()
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
     text = str(value).strip()
     for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d.%m.%Y", "%d %B %Y", "%d %b %Y"):
         try:
@@ -188,12 +190,12 @@ def parse_date(value):
 
 
 def format_rate(value) -> str:
-    if pd.isna(value):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
         return "?"
     try:
         num = float(value)
         # Si viene como fracción (0.01) lo pasamos a porcentaje.
-        if num <= 1:
+        if abs(num) <= 1:
             num *= 100
         num = round(num, 2)
         return f"{num:g}%"
@@ -211,52 +213,65 @@ def format_date_es(d: date) -> str:
 # LÓGICA PRINCIPAL
 # ---------------------------------------------------------------------------
 
-def build_row_snapshot(df: pd.DataFrame, country_col: str) -> dict:
-    """Serializa cada fila (todas las columnas) por país, para poder
-    detectar CUALQUIER cambio publicado por la ESRB, sepamos o no
-    interpretar cada columna."""
-    snapshot = {}
+def compute_table_hash(df: pd.DataFrame) -> str:
+    """Hash de toda la tabla (todas las columnas, todas las filas),
+    independiente de si sabemos interpretar cada columna. Sirve para saber
+    si la ESRB ha tocado CUALQUIER cosa desde el último chequeo."""
+    canonical = df.fillna("").astype(str)
+    canonical = canonical.sort_values(by=list(canonical.columns)).reset_index(drop=True)
+    payload = canonical.to_csv(index=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def build_country_timelines(df: pd.DataFrame, cols: dict) -> dict:
+    """Devuelve {país: [(fecha_aplicacion, tasa_raw), ...]} ordenado por fecha."""
+    timelines = {}
+    country_col = cols["country"]
+    rate_col = cols["rate"]
+    date_col = cols["application_date"]
+
     for _, row in df.iterrows():
         country = str(row.get(country_col, "")).strip()
         if not country or country.lower() == "nan":
             continue
-        snapshot[country] = {str(k): ("" if pd.isna(v) else str(v))
-                              for k, v in row.items()}
-    return snapshot
+
+        app_date = parse_date(row.get(date_col))
+        rate_raw = row.get(rate_col)
+        if app_date is None or pd.isna(rate_raw):
+            continue
+
+        timelines.setdefault(country, []).append((app_date, rate_raw))
+
+    for country in timelines:
+        timelines[country].sort(key=lambda x: x[0])
+
+    return timelines
 
 
-def find_upcoming_changes(df: pd.DataFrame, cols: dict, today: date) -> list:
-    """Busca, país por país, cambios de tasa cuya fecha de aplicación
-    caiga dentro de la ventana 'a un mes vista'."""
+def find_upcoming_changes(timelines: dict, today: date) -> list:
+    """Para cada país, mira si hay una decisión cuya fecha de aplicación
+    caiga dentro de la ventana 'a un mes vista', y calcula cuál es la
+    tasa vigente hoy para poder mostrar el 'antes -> después'."""
     upcoming = []
-    required = ["country", "future_rate", "future_date"]
-    if not all(cols.get(c) for c in required):
-        return upcoming  # no se pudieron identificar las columnas necesarias
-
     window_end = today + timedelta(days=LOOKAHEAD_DAYS)
 
-    for _, row in df.iterrows():
-        country = str(row.get(cols["country"], "")).strip()
-        if not country or country.lower() == "nan":
-            continue
+    for country, entries in timelines.items():
+        # Tasa vigente hoy: la última decisión cuya fecha ya ha pasado.
+        current_rate_raw = None
+        for app_date, rate_raw in entries:
+            if app_date <= today:
+                current_rate_raw = rate_raw
+            else:
+                break  # entries está ordenado, ya no hace falta seguir para "hoy"
 
-        future_rate_raw = row.get(cols["future_rate"])
-        future_date_raw = row.get(cols["future_date"])
-        if pd.isna(future_rate_raw) or pd.isna(future_date_raw):
-            continue
-
-        effective_date = parse_date(future_date_raw)
-        if not effective_date:
-            continue
-
-        if today <= effective_date <= window_end:
-            current_rate_raw = row.get(cols.get("current_rate")) if cols.get("current_rate") else None
-            upcoming.append({
-                "country": country,
-                "current_rate": format_rate(current_rate_raw) if current_rate_raw is not None else "?",
-                "future_rate": format_rate(future_rate_raw),
-                "effective_date": effective_date,
-            })
+        for app_date, rate_raw in entries:
+            if today < app_date <= window_end:
+                upcoming.append({
+                    "country": country,
+                    "current_rate": format_rate(current_rate_raw) if current_rate_raw is not None else "0%",
+                    "future_rate": format_rate(rate_raw),
+                    "effective_date": app_date,
+                })
 
     return upcoming
 
@@ -272,7 +287,7 @@ def compose_email_body(upcoming: list, esrb_changed_since_last_check: bool,
     if upcoming:
         for item in sorted(upcoming, key=lambda x: x["effective_date"]):
             lines.append(
-                f"  • {item['country']} subirá/cambiará el CCyB del "
+                f"  • {item['country']}: el CCyB pasará del "
                 f"{item['current_rate']} al {item['future_rate']}, "
                 f"efectivo desde el {format_date_es(item['effective_date'])}."
             )
@@ -329,14 +344,17 @@ def run_diagnose():
         estado = col if col else "NO ENCONTRADA (ajusta COLUMN_HINTS)"
         print(f"  - {category}: {estado}")
 
+    if cols.get("country") and cols.get("rate") and cols.get("application_date"):
+        timelines = build_country_timelines(df, cols)
+        today = date.today()
+        upcoming = find_upcoming_changes(timelines, today)
+        print(f"\nPaíses con histórico de decisiones detectados: {len(timelines)}")
+        print(f"Cambios a un mes vista encontrados HOY ({today}): {len(upcoming)}")
+        for item in upcoming:
+            print(f"  - {item}")
+
     print("\nPrimeras filas:")
     print(df.head(10).to_string())
-
-    print(
-        "\nSi alguna categoría aparece como 'NO ENCONTRADA', abre el Excel, "
-        "localiza el nombre real de esa columna y añade una palabra clave "
-        "suya (en minúsculas y sin tildes) a COLUMN_HINTS en este script."
-    )
 
 
 def run_check(dry_run: bool = False):
@@ -346,28 +364,33 @@ def run_check(dry_run: bool = False):
     df = load_table(xlsx_bytes)
     cols = detect_columns(df)
 
-    if not cols.get("country"):
+    required = ["country", "rate", "application_date"]
+    missing = [c for c in required if not cols.get(c)]
+    if missing:
         raise RuntimeError(
-            "No se ha podido identificar la columna de país en el Excel. "
+            f"No se han podido identificar estas columnas: {missing}. "
             "Ejecuta 'python ccyb_monitor.py --diagnose' y ajusta COLUMN_HINTS."
         )
 
     # 1) ¿Ha cambiado algo respecto a la última vez que se comprobó?
-    new_snapshot = build_row_snapshot(df, cols["country"])
-    old_snapshot = {}
+    new_hash = compute_table_hash(df)
+    old_data = {}
     if SNAPSHOT_PATH.exists():
-        old_snapshot = json.loads(SNAPSHOT_PATH.read_text(encoding="utf-8"))
+        old_data = json.loads(SNAPSHOT_PATH.read_text(encoding="utf-8"))
+    old_hash = old_data.get("table_hash")
 
-    esrb_changed_since_last_check = new_snapshot != old_snapshot
+    esrb_changed_since_last_check = (old_hash is not None) and (new_hash != old_hash)
+    first_run = old_hash is None
 
     # 2) Cambios a un mes vista
-    upcoming = find_upcoming_changes(df, cols, today)
+    timelines = build_country_timelines(df, cols)
+    upcoming = find_upcoming_changes(timelines, today)
 
     # 3) Email (siempre se manda, una vez al mes)
     subject = "Informe mensual CCyB — " + (
         "cambios a un mes vista" if upcoming else "sin cambios a un mes vista"
     )
-    body = compose_email_body(upcoming, esrb_changed_since_last_check, today)
+    body = compose_email_body(upcoming, esrb_changed_since_last_check and not first_run, today)
 
     print(body)
 
@@ -375,7 +398,9 @@ def run_check(dry_run: bool = False):
         send_email(subject, body)
         SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
         SNAPSHOT_PATH.write_text(
-            json.dumps(new_snapshot, ensure_ascii=False, indent=2), encoding="utf-8"
+            json.dumps({"table_hash": new_hash, "last_checked": today.isoformat()},
+                       ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
     else:
         print("\n[--dry-run] No se ha enviado ningún email ni actualizado el snapshot.")
