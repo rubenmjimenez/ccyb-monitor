@@ -190,14 +190,13 @@ def parse_date(value):
 
 
 def format_rate(value) -> str:
+    """En el Excel de la ESRB, la columna 'CCyB rate' ya viene expresada
+    directamente en puntos porcentuales (1 = 1%, 0.5 = 0.5%, 2 = 2%), NO
+    como fracción. No hay que multiplicar por 100."""
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return "?"
     try:
-        num = float(value)
-        # Si viene como fracción (0.01) lo pasamos a porcentaje.
-        if abs(num) <= 1:
-            num *= 100
-        num = round(num, 2)
+        num = round(float(value), 2)
         return f"{num:g}%"
     except (TypeError, ValueError):
         return str(value)
