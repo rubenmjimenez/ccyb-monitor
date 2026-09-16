@@ -1,0 +1,61 @@
+name: CCyB monthly check
+
+on:
+  schedule:
+    # Día 1 de cada mes a las 08:00 UTC (~09:00/10:00 hora de Madrid según horario)
+    - cron: "0 8 1 * *"
+  workflow_dispatch:       # permite lanzarlo a mano desde la pestaña Actions
+    inputs:
+      mode:
+        description: "Modo de ejecución"
+        required: true
+        default: "check"
+        type: choice
+        options:
+          - check       # ejecución normal: analiza y envía el email
+          - diagnose    # solo imprime la estructura del Excel, no envía nada
+          - dry-run     # hace todo el análisis pero no envía ni guarda nada
+
+permissions:
+  contents: write   # necesario para poder guardar el nuevo snapshot en el repo
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run CCyB monitor
+        env:
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          MODE: ${{ github.event.inputs.mode || 'check' }}
+        run: |
+          if [ "$MODE" = "diagnose" ]; then
+            python ccyb_monitor.py --diagnose
+          elif [ "$MODE" = "dry-run" ]; then
+            python ccyb_monitor.py --dry-run
+          else
+            python ccyb_monitor.py
+          fi
+
+      - name: Commit updated snapshot
+        run: |
+          git config user.name "ccyb-monitor-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/last_snapshot.json
+          git diff --cached --quiet || git commit -m "Actualiza snapshot CCyB [skip ci]"
+          git push
