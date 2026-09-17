@@ -9,13 +9,10 @@ de capital anticíclico (CCyB) de cada país:
     https://www.esrb.europa.eu/national_policy/ccb/shared/data/esrb.ccybd_CCyB_data.xlsx
 
 El archivo es una BASE DE DATOS HISTÓRICA: cada fila es una decisión de un
-país (columnas reales confirmadas: 'Country', 'Decision on',
-'Date of Announcement', 'CCyB rate', 'Type of setting', 'Application since',
-'Credit-to-GDP', 'Reference date', 'Credit Gap', 'Buffer Guide',
-'Additional Gap', 'Additional benchmark', 'Justification',
-'Justification exceptional circumstances', 'Period without decrease', 'Link').
-Un mismo país puede tener muchas filas: unas con fecha de aplicación ya
-pasada (vigentes) y otras con fecha futura (pendientes).
+país (columnas reales: 'Country', 'Decision on', 'Date of Announcement',
+'CCyB rate', 'Type of setting', 'Application since', ...). Un mismo país
+puede tener varias filas: unas con fecha de aplicación ya pasada (vigentes)
+y otras con fecha futura (pendientes).
 
 Cada vez que se ejecuta este script:
   1. Descarga el Excel más reciente.
@@ -26,28 +23,31 @@ Cada vez que se ejecuta este script:
      'Application since' más reciente que ya haya pasado) y busca si hay
      alguna decisión pendiente cuya 'Application since' caiga dentro de la
      ventana "a un mes vista" (por defecto, los próximos 35 días).
-  4. Envía SIEMPRE un email mensual con el resultado:
-       - Si hay cambios a un mes vista: los detalla país por país,
-         ej. "Polonia subirá el CCyB del 1% al 2%, efectivo desde el 30
-         de septiembre de 2026."
-       - Si no hay ninguno: "No se han detectado cambios de CCyB en
-         ningún país a un mes vista."
+  4. Envía SIEMPRE un email mensual con el resultado (a uno o varios
+     destinatarios) y, si hay cambios a un mes vista, adjunta un script
+     .sql con los UPDATE necesarios sobre la tabla
+     dbo.colchon_capital_anticiclico para la fecha de cierre trimestral
+     que corresponda a cada cambio.
 
 -------------------------------------------------------------------------
-CALIBRACIÓN
+LÓGICA DE LA FECHA DE CIERRE (confirmada con el usuario)
 -------------------------------------------------------------------------
-Ejecuta en cualquier momento (localmente o vía GitHub Actions con
-mode=diagnose):
+Las fechas de cierre trimestral son siempre el día 1 de enero, abril,
+julio u octubre (cod_entidad_fecha / cod_pais_fecha usan esa fecha, no la
+fecha real de entrada en vigor del cambio). Dado un cambio con fecha de
+entrada en vigor D, la fecha de cierre que le corresponde es la PRIMERA
+fecha de trimestre (01/01, 01/04, 01/07, 01/10) ESTRICTAMENTE POSTERIOR a
+D (si D coincide exactamente con un inicio de trimestre, se usa el
+siguiente, no ese mismo).
 
-    python ccyb_monitor.py --diagnose
-
-para ver las columnas reales del Excel y confirmar que el script las ha
-identificado bien. Si la ESRB cambia el nombre de alguna columna en el
-futuro, este modo te lo dirá y solo tendrás que añadir la palabra nueva a
-COLUMN_HINTS, un poco más abajo.
+Ejemplos verificados:
+  - Polonia, entra en vigor el 30/09/2026  -> cierre 01/10/2026 (cierre "septiembre26")
+  - Grecia/España, entran en vigor el 01/10/2026 (coincide con inicio de
+    trimestre) -> cierre 01/01/2027 (cierre "diciembre26")
 """
 
 import argparse
+import csv
 import hashlib
 import io
 import json
@@ -56,6 +56,7 @@ import smtplib
 import sys
 import unicodedata
 from datetime import date, datetime, timedelta
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 
@@ -70,14 +71,11 @@ XLSX_URL = "https://www.esrb.europa.eu/national_policy/ccb/shared/data/esrb.ccyb
 
 BASE_DIR = Path(__file__).resolve().parent
 SNAPSHOT_PATH = BASE_DIR / "data" / "last_snapshot.json"
+ISO_CODES_PATH = BASE_DIR / "data" / "country_iso_codes.csv"
 
 # "A un mes vista": margen en días. 35 cubre con holgura cualquier mes del año.
 LOOKAHEAD_DAYS = 35
 
-# Palabras clave (en minúsculas y sin acentos) para reconocer cada columna
-# automáticamente. Confirmadas contra el Excel real de la ESRB (sept. 2026):
-# 'Country', 'Decision on', 'Date of Announcement', 'CCyB rate',
-# 'Type of setting', 'Application since', ...
 COLUMN_HINTS = {
     "country": ["country"],
     "rate": ["ccyb rate", "rate"],
@@ -86,16 +84,42 @@ COLUMN_HINTS = {
     "announcement_date": ["date of announcement"],
 }
 
+# Nombre (en inglés, tal como aparece en el Excel de la ESRB, en mayúsculas
+# y sin acentos) -> alias a buscar en country_iso_codes.csv, para los casos
+# donde el nombre no coincide literalmente.
+COUNTRY_NAME_ALIASES = {
+    "NETHERLANDS": "THE NETHERLANDS",
+    "CZECHIA": "CZECH REPUBLIC",
+    "SLOVAK REPUBLIC": "SLOVAKIA",
+}
+
+# Traducción al español, solo para que los comentarios del SQL queden
+# legibles (si un país no está aquí, se usa el nombre en inglés tal cual,
+# sin que el script falle).
+COUNTRY_NAME_ES = {
+    "AUSTRIA": "Austria", "BELGIUM": "Bélgica", "BULGARIA": "Bulgaria",
+    "CROATIA": "Croacia", "CYPRUS": "Chipre", "CZECHIA": "República Checa",
+    "CZECH REPUBLIC": "República Checa", "DENMARK": "Dinamarca",
+    "ESTONIA": "Estonia", "FINLAND": "Finlandia", "FRANCE": "Francia",
+    "GERMANY": "Alemania", "GREECE": "Grecia", "HUNGARY": "Hungría",
+    "ICELAND": "Islandia", "IRELAND": "Irlanda", "ITALY": "Italia",
+    "LATVIA": "Letonia", "LIECHTENSTEIN": "Liechtenstein",
+    "LITHUANIA": "Lituania", "LUXEMBOURG": "Luxemburgo", "MALTA": "Malta",
+    "NETHERLANDS": "Países Bajos", "NORWAY": "Noruega", "POLAND": "Polonia",
+    "PORTUGAL": "Portugal", "ROMANIA": "Rumanía", "SLOVAKIA": "Eslovaquia",
+    "SLOVAK REPUBLIC": "Eslovaquia", "SLOVENIA": "Eslovenia", "SPAIN": "España",
+    "SWEDEN": "Suecia", "UNITED KINGDOM": "Reino Unido",
+}
+
 # Email
 MAIL_FROM = os.environ.get("MAIL_FROM", "no-reply@ccyb-monitor.local")
-MAIL_TO = os.environ.get("MAIL_TO")  # tu correo corporativo, obligatorio
+MAIL_TO = os.environ.get("MAIL_TO")  # uno o varios, separados por comas
 SMTP_HOST = os.environ.get("SMTP_HOST")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ.get("SMTP_USER")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 
 REQUEST_HEADERS = {
-    # Algunos servidores rechazan peticiones sin cabecera de navegador.
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -116,6 +140,10 @@ def normalize(text: str) -> str:
     return strip_accents(str(text)).lower().strip()
 
 
+def normalize_country_key(text: str) -> str:
+    return strip_accents(str(text)).upper().strip()
+
+
 def download_xlsx() -> bytes:
     resp = requests.get(XLSX_URL, headers=REQUEST_HEADERS, timeout=30)
     resp.raise_for_status()
@@ -123,8 +151,6 @@ def download_xlsx() -> bytes:
 
 
 def load_table(xlsx_bytes: bytes) -> pd.DataFrame:
-    """Carga la primera hoja con datos del Excel, detectando la fila de
-    cabecera aunque no sea la primera línea del fichero."""
     raw = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=0, header=None)
 
     header_row = None
@@ -134,7 +160,6 @@ def load_table(xlsx_bytes: bytes) -> pd.DataFrame:
                for h in COLUMN_HINTS["country"]):
             header_row = i
             break
-
     if header_row is None:
         header_row = 0
 
@@ -145,9 +170,6 @@ def load_table(xlsx_bytes: bytes) -> pd.DataFrame:
 
 
 def detect_columns(df: pd.DataFrame) -> dict:
-    """Empareja cada columna del Excel con una categoría de COLUMN_HINTS.
-    Usa coincidencia por palabra clave más larga primero, para evitar que
-    p.ej. 'rate' (hint genérico) se cuele antes que 'ccyb rate'."""
     detected = {}
     normalized_cols = {col: normalize(col) for col in df.columns}
     used_cols = set()
@@ -190,9 +212,8 @@ def parse_date(value):
 
 
 def format_rate(value) -> str:
-    """En el Excel de la ESRB, la columna 'CCyB rate' ya viene expresada
-    directamente en puntos porcentuales (1 = 1%, 0.5 = 0.5%, 2 = 2%), NO
-    como fracción. No hay que multiplicar por 100."""
+    """La columna 'CCyB rate' del Excel de la ESRB ya viene en puntos
+    porcentuales (1 = 1%, 0.5 = 0.5%). No hay que multiplicar por 100."""
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return "?"
     try:
@@ -202,6 +223,13 @@ def format_rate(value) -> str:
         return str(value)
 
 
+def rate_sql_literal(value) -> str:
+    """Igual que format_rate pero sin el símbolo %, para usar como número
+    en el SQL (2 -> '2', 0.5 -> '0.5')."""
+    num = round(float(value), 2)
+    return f"{num:g}"
+
+
 def format_date_es(d: date) -> str:
     meses = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
              "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
@@ -209,13 +237,40 @@ def format_date_es(d: date) -> str:
 
 
 # ---------------------------------------------------------------------------
-# LÓGICA PRINCIPAL
+# CÓDIGOS ISO Y NOMBRES DE PAÍS
+# ---------------------------------------------------------------------------
+
+def load_iso_codes() -> dict:
+    """Carga data/country_iso_codes.csv -> {NOMBRE_NORMALIZADO: codigo_iso}."""
+    mapping = {}
+    if not ISO_CODES_PATH.exists():
+        return mapping
+    with open(ISO_CODES_PATH, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            code = row.get("cod_iso_3166", "").strip()
+            desc = row.get("descripcion", "").strip()
+            if code and desc:
+                mapping[normalize_country_key(desc)] = code
+    return mapping
+
+
+def country_to_iso(country_name: str, iso_map: dict) -> str | None:
+    key = normalize_country_key(country_name)
+    key = normalize_country_key(COUNTRY_NAME_ALIASES.get(key, key))
+    return iso_map.get(key)
+
+
+def country_to_es(country_name: str) -> str:
+    key = normalize_country_key(country_name)
+    return COUNTRY_NAME_ES.get(key, country_name)
+
+
+# ---------------------------------------------------------------------------
+# LÓGICA PRINCIPAL: LECTURA DEL EXCEL
 # ---------------------------------------------------------------------------
 
 def compute_table_hash(df: pd.DataFrame) -> str:
-    """Hash de toda la tabla (todas las columnas, todas las filas),
-    independiente de si sabemos interpretar cada columna. Sirve para saber
-    si la ESRB ha tocado CUALQUIER cosa desde el último chequeo."""
     canonical = df.fillna("").astype(str)
     canonical = canonical.sort_values(by=list(canonical.columns)).reset_index(drop=True)
     payload = canonical.to_csv(index=False)
@@ -223,7 +278,6 @@ def compute_table_hash(df: pd.DataFrame) -> str:
 
 
 def build_country_timelines(df: pd.DataFrame, cols: dict) -> dict:
-    """Devuelve {país: [(fecha_aplicacion, tasa_raw), ...]} ordenado por fecha."""
     timelines = {}
     country_col = cols["country"]
     rate_col = cols["rate"]
@@ -248,25 +302,23 @@ def build_country_timelines(df: pd.DataFrame, cols: dict) -> dict:
 
 
 def find_upcoming_changes(timelines: dict, today: date) -> list:
-    """Para cada país, mira si hay una decisión cuya fecha de aplicación
-    caiga dentro de la ventana 'a un mes vista', y calcula cuál es la
-    tasa vigente hoy para poder mostrar el 'antes -> después'."""
     upcoming = []
     window_end = today + timedelta(days=LOOKAHEAD_DAYS)
 
     for country, entries in timelines.items():
-        # Tasa vigente hoy: la última decisión cuya fecha ya ha pasado.
         current_rate_raw = None
         for app_date, rate_raw in entries:
             if app_date <= today:
                 current_rate_raw = rate_raw
             else:
-                break  # entries está ordenado, ya no hace falta seguir para "hoy"
+                break
 
         for app_date, rate_raw in entries:
             if today < app_date <= window_end:
                 upcoming.append({
                     "country": country,
+                    "current_rate_raw": current_rate_raw,
+                    "future_rate_raw": rate_raw,
                     "current_rate": format_rate(current_rate_raw) if current_rate_raw is not None else "0%",
                     "future_rate": format_rate(rate_raw),
                     "effective_date": app_date,
@@ -275,8 +327,90 @@ def find_upcoming_changes(timelines: dict, today: date) -> list:
     return upcoming
 
 
+# ---------------------------------------------------------------------------
+# LÓGICA DE FECHA DE CIERRE Y GENERACIÓN DE SQL
+# ---------------------------------------------------------------------------
+
+def next_quarter_start_after(d: date) -> date:
+    """Primera fecha de trimestre (01/01, 01/04, 01/07, 01/10)
+    ESTRICTAMENTE posterior a d."""
+    candidates = []
+    for y in (d.year, d.year + 1):
+        for m in (1, 4, 7, 10):
+            candidates.append(date(y, m, 1))
+    candidates = sorted(c for c in candidates if c > d)
+    return candidates[0]
+
+
+def closing_label(closing_date: date):
+    """Devuelve (nombre_mes_cierre, año_cierre) a partir de la fecha de
+    cierre (01/01, 01/04, 01/07, 01/10). Ej: 2027-01-01 -> ('diciembre', 2026)."""
+    month = closing_date.month
+    if month == 1:
+        return "diciembre", closing_date.year - 1
+    elif month == 4:
+        return "marzo", closing_date.year
+    elif month == 7:
+        return "junio", closing_date.year
+    elif month == 10:
+        return "septiembre", closing_date.year
+    raise ValueError(f"Fecha de cierre inesperada: {closing_date}")
+
+
+def build_sql_script(upcoming: list, iso_map: dict) -> tuple[str, list]:
+    """Genera el script SQL con un UPDATE por cada cambio a un mes vista.
+    Devuelve (texto_sql, lista_de_avisos) — avisos para países sin código
+    ISO reconocido, que se omiten del SQL y hay que revisar a mano."""
+    lines = [
+        "-- Script generado automáticamente por ccyb_monitor.py",
+        f"-- Generado el {date.today().isoformat()}",
+        "-- Actualiza dbo.colchon_capital_anticiclico con los cambios de CCyB",
+        "-- detectados a un mes vista. Revisar antes de ejecutar en producción.",
+        "",
+    ]
+    warnings = []
+
+    for item in sorted(upcoming, key=lambda x: x["effective_date"]):
+        iso = country_to_iso(item["country"], iso_map)
+        if not iso:
+            warnings.append(item["country"])
+            lines.append(
+                f"-- ATENCIÓN: no se ha encontrado código ISO para "
+                f"'{item['country']}'. Revisar y añadir manualmente."
+            )
+            lines.append("")
+            continue
+
+        closing_date = next_quarter_start_after(item["effective_date"])
+        mes, anyo = closing_label(closing_date)
+        yy = str(anyo)[-2:]
+        closing_str = closing_date.strftime("%Y/%m/%d")
+        fecha_informacion = closing_date.strftime("%Y%m%d")
+        rate_str = rate_sql_literal(item["future_rate_raw"])
+        country_es = country_to_es(item["country"])
+
+        lines.append(f"--{country_es} (actualizado a cierre de {mes}{yy})")
+        lines.append(
+            f"update dbo.colchon_capital_anticiclico set porc_buff_antici_autoridad = {rate_str}, "
+        )
+        lines.append(
+            f"porc_buff_antici_pais_enti = {rate_str}, porc_buff_antici_espec_enti = {rate_str} "
+        )
+        lines.append("from colchon_capital_anticiclico")
+        lines.append(
+            f"where fecha_informacion = '{fecha_informacion}' and cod_pais_fecha = '{iso} {closing_str}'"
+        )
+        lines.append("")
+
+    return "\n".join(lines), warnings
+
+
+# ---------------------------------------------------------------------------
+# EMAIL
+# ---------------------------------------------------------------------------
+
 def compose_email_body(upcoming: list, esrb_changed_since_last_check: bool,
-                        today: date) -> str:
+                        today: date, sql_warnings: list) -> str:
     lines = []
     lines.append(f"Informe mensual del colchón de capital anticíclico (CCyB) — {format_date_es(today)}")
     lines.append("Fuente: ESRB — https://www.esrb.europa.eu/national_policy/ccb/html/index.en.html")
@@ -290,8 +424,20 @@ def compose_email_body(upcoming: list, esrb_changed_since_last_check: bool,
                 f"{item['current_rate']} al {item['future_rate']}, "
                 f"efectivo desde el {format_date_es(item['effective_date'])}."
             )
+        lines.append("")
+        lines.append(
+            "Se adjunta script SQL con los UPDATE necesarios sobre "
+            "dbo.colchon_capital_anticiclico para estos cambios."
+        )
     else:
         lines.append("  No se han detectado cambios de CCyB en ningún país a un mes vista.")
+
+    if sql_warnings:
+        lines.append("")
+        lines.append(
+            "AVISO: no se ha encontrado código ISO para: " + ", ".join(sql_warnings) +
+            ". Revisa esos países manualmente (quedan comentados en el SQL adjunto)."
+        )
 
     lines.append("")
     if esrb_changed_since_last_check:
@@ -308,25 +454,37 @@ def compose_email_body(upcoming: list, esrb_changed_since_last_check: bool,
     return "\n".join(lines)
 
 
-def send_email(subject: str, body: str):
+def send_email(subject: str, body: str, attachment_name: str = None, attachment_text: str = None):
     if not MAIL_TO:
-        raise RuntimeError("Falta la variable de entorno MAIL_TO (tu email corporativo).")
+        raise RuntimeError("Falta la variable de entorno MAIL_TO (uno o varios emails, separados por comas).")
     if not (SMTP_HOST and SMTP_USER and SMTP_PASSWORD):
         raise RuntimeError(
             "Faltan credenciales SMTP (SMTP_HOST / SMTP_USER / SMTP_PASSWORD). "
             "Revisa el README para configurarlas."
         )
 
-    msg = MIMEText(body, "plain", "utf-8")
+    recipients = [addr.strip() for addr in MAIL_TO.split(",") if addr.strip()]
+
+    msg = MIMEMultipart()
     msg["Subject"] = subject
     msg["From"] = MAIL_FROM
-    msg["To"] = MAIL_TO
+    msg["To"] = ", ".join(recipients)
+    msg.attach(MIMEText(body, "plain", "utf-8"))
+
+    if attachment_name and attachment_text is not None:
+        part = MIMEText(attachment_text, "plain", "utf-8")
+        part.add_header("Content-Disposition", "attachment", filename=attachment_name)
+        msg.attach(part)
 
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
         server.starttls()
         server.login(SMTP_USER, SMTP_PASSWORD)
-        server.sendmail(MAIL_FROM, [MAIL_TO], msg.as_string())
+        server.sendmail(MAIL_FROM, recipients, msg.as_string())
 
+
+# ---------------------------------------------------------------------------
+# COMANDOS
+# ---------------------------------------------------------------------------
 
 def run_diagnose():
     print(f"Descargando {XLSX_URL} ...")
@@ -343,6 +501,9 @@ def run_diagnose():
         estado = col if col else "NO ENCONTRADA (ajusta COLUMN_HINTS)"
         print(f"  - {category}: {estado}")
 
+    iso_map = load_iso_codes()
+    print(f"\nCódigos ISO cargados: {len(iso_map)} países ({ISO_CODES_PATH.name})")
+
     if cols.get("country") and cols.get("rate") and cols.get("application_date"):
         timelines = build_country_timelines(df, cols)
         today = date.today()
@@ -350,7 +511,16 @@ def run_diagnose():
         print(f"\nPaíses con histórico de decisiones detectados: {len(timelines)}")
         print(f"Cambios a un mes vista encontrados HOY ({today}): {len(upcoming)}")
         for item in upcoming:
-            print(f"  - {item}")
+            iso = country_to_iso(item["country"], iso_map)
+            print(f"  - {item['country']} (ISO: {iso or 'NO ENCONTRADO'}): "
+                  f"{item['current_rate']} -> {item['future_rate']} el {item['effective_date']}")
+
+        if upcoming:
+            sql_text, warnings = build_sql_script(upcoming, iso_map)
+            print("\n--- SQL que se generaría ---")
+            print(sql_text)
+            if warnings:
+                print(f"AVISO: sin código ISO para: {warnings}")
 
     print("\nPrimeras filas:")
     print(df.head(10).to_string())
@@ -371,7 +541,6 @@ def run_check(dry_run: bool = False):
             "Ejecuta 'python ccyb_monitor.py --diagnose' y ajusta COLUMN_HINTS."
         )
 
-    # 1) ¿Ha cambiado algo respecto a la última vez que se comprobó?
     new_hash = compute_table_hash(df)
     old_data = {}
     if SNAPSHOT_PATH.exists():
@@ -381,20 +550,27 @@ def run_check(dry_run: bool = False):
     esrb_changed_since_last_check = (old_hash is not None) and (new_hash != old_hash)
     first_run = old_hash is None
 
-    # 2) Cambios a un mes vista
     timelines = build_country_timelines(df, cols)
     upcoming = find_upcoming_changes(timelines, today)
 
-    # 3) Email (siempre se manda, una vez al mes)
+    iso_map = load_iso_codes()
+    sql_text, sql_warnings = ("", [])
+    if upcoming:
+        sql_text, sql_warnings = build_sql_script(upcoming, iso_map)
+
     subject = "Informe mensual CCyB — " + (
         "cambios a un mes vista" if upcoming else "sin cambios a un mes vista"
     )
-    body = compose_email_body(upcoming, esrb_changed_since_last_check and not first_run, today)
+    body = compose_email_body(upcoming, esrb_changed_since_last_check and not first_run, today, sql_warnings)
 
     print(body)
+    if upcoming:
+        print("\n--- SQL adjunto ---")
+        print(sql_text)
 
     if not dry_run:
-        send_email(subject, body)
+        attachment_name = f"actualizacion_ccyb_{today.isoformat()}.sql" if upcoming else None
+        send_email(subject, body, attachment_name, sql_text if upcoming else None)
         SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
         SNAPSHOT_PATH.write_text(
             json.dumps({"table_hash": new_hash, "last_checked": today.isoformat()},
